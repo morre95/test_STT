@@ -8,7 +8,7 @@ import json
 import sys
 import time
 import traceback
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -62,11 +62,11 @@ class QwenWorker:
 
 
 class NemotronWorker:
-    RIGHT_CONTEXT = {80: 0, 160: 1, 320: 3, 560: 6, 1120: 13}
+    RIGHT_CONTEXT: ClassVar = {80: 0, 160: 1, 320: 3, 560: 6, 1120: 13}
 
     def __init__(self, checkpoint: str):
-        import torch
         import nemo.collections.asr as nemo_asr
+        import torch
 
         if not torch.cuda.is_available():
             raise RuntimeError("Nemotron requires a working CUDA device")
@@ -83,8 +83,8 @@ class NemotronWorker:
                 "gpu": self.torch.cuda.get_device_name(0)}
 
     def _make_preprocessor(self):
-        from omegaconf import OmegaConf
         from nemo.collections.asr.models import EncDecCTCModelBPE
+        from omegaconf import OmegaConf
 
         cfg = copy.deepcopy(self.model._cfg)
         OmegaConf.set_struct(cfg.preprocessor, False)
@@ -185,7 +185,7 @@ def main():
                     raise ValueError(f"Unknown operation: {request['op']}")
             result["processing_ms"] = (time.perf_counter() - started) * 1000
             reply(result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - return all worker failures to API
             traceback.print_exc(file=sys.stderr)
             reply({"error": f"{type(exc).__name__}: {exc}"})
 

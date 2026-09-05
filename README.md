@@ -28,6 +28,13 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 
 Modellvikterna hämtas från Hugging Face första gången modellen väljs. Qwen använder officiell vLLM-streaming och Nemotron använder NeMos cache-aware RNNT-streaming. Endast en modell ligger i GPU-minnet åt gången.
 
+Verifiera modellkedjan utan telefon med två sekunders tyst PCM:
+
+```bash
+uv run python smoke_model.py qwen-0.6b
+uv run python smoke_model.py nemotron-0.6b
+```
+
 ## Android
 
 Kör `flutter pub get` och `flutter run` i `app/`. Standardadressen `10.0.2.2:8000` gäller Android-emulatorn. På en fysisk telefon anger du datorns LAN-adress, exempelvis `192.168.1.20:8000`.

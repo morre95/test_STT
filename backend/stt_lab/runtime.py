@@ -20,10 +20,23 @@ class Runtime:
             raise RuntimeError("Model process is not running; see backend/data/runtime.log")
         self.process.stdin.write((json.dumps(message) + "\n").encode())
         await self.process.stdin.drain()
-        line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
-        if not line:
-            raise RuntimeError("Model process exited; see backend/data/runtime.log")
-        reply = json.loads(line)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("Model process did not return a protocol response")
+            line = await asyncio.wait_for(self.process.stdout.readline(), remaining)
+            if not line:
+                raise RuntimeError("Model process exited; see backend/data/runtime.log")
+            try:
+                reply = json.loads(line)
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # vLLM child processes can inherit stdout and emit startup logs
+                # despite Python-level redirection in the worker.
+                if self.log:
+                    self.log.write(line.decode(errors="replace"))
+                    self.log.flush()
         if "error" in reply:
             raise RuntimeError(reply["error"])
         return reply
@@ -62,7 +75,7 @@ class Runtime:
                 pass
             try:
                 await asyncio.wait_for(self.process.wait(), 10)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except ProcessLookupError:

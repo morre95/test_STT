@@ -4,7 +4,7 @@ import os
 import time
 import wave
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -138,7 +138,7 @@ def create_app(data_dir=None, runtime=None, catalog=None):
             else:
                 recording_id = store.create_recording()
             run = {"id": str(uuid4()), "recording_id": recording_id,
-                   "created_at": datetime.now(timezone.utc).isoformat(),
+                   "created_at": datetime.now(UTC).isoformat(),
                    "model": start.model, "checkpoint": spec["checkpoint"],
                    "language": start.language, "settings": settings,
                    "mode": "replay" if replay else "live", "status": "running", "text": ""}
@@ -149,7 +149,7 @@ def create_app(data_dir=None, runtime=None, catalog=None):
             await engine.start(start.language, settings)
             run["load_ms"] = (time.perf_counter() - load_started) * 1000
             if not replay:
-                writer = wave.open(str(store.audio_path(recording_id)), "wb")
+                writer = wave.open(str(store.audio_path(recording_id)), "wb")  # noqa: SIM115
                 writer.setnchannels(1)
                 writer.setsampwidth(2)
                 writer.setframerate(16000)
@@ -252,7 +252,7 @@ def create_app(data_dir=None, runtime=None, catalog=None):
                 store.finish_recording(recording_id, duration, True)
             store.save_run(run)
             await ws.send_json({"type": "final", "seq": sequence + 1, **run})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - WebSocket protocol boundary
             if run:
                 run.update(status="failed", error=str(exc) or type(exc).__name__,
                            duration=received / BYTES_PER_SECOND, processing_ms=processing)

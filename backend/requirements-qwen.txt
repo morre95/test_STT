@@ -1,3 +1,2 @@
 numpy>=1.26
-qwen-asr[vllm]
-
+qwen-asr[vllm]==0.0.6

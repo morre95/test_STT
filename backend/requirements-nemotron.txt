@@ -1,5 +1,4 @@
 numpy>=1.26
 Cython
 packaging
-nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
-
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@ca4daa1470f6c01068c4e6a9a73b19b9a91dc366

@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,7 +37,7 @@ class Store:
         ident = str(uuid4())
         with self.connect() as db:
             db.execute("INSERT INTO recordings(id,created_at) VALUES(?,?)",
-                       (ident, datetime.now(timezone.utc).isoformat()))
+                       (ident, datetime.now(UTC).isoformat()))
         return ident
 
     def audio_path(self, ident):
