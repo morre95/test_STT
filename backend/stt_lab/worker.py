@@ -5,6 +5,7 @@ import base64
 import contextlib
 import copy
 import json
+import re
 import sys
 import time
 import traceback
@@ -12,10 +13,16 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+SAMPLE_RATE = 16000
+
 
 def reply(payload: dict[str, Any]) -> None:
     sys.__stdout__.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.__stdout__.flush()
+
+
+def to_float32(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 
 
 def language(code: str, family: str) -> str | None:
@@ -49,7 +56,7 @@ class QwenWorker:
     def audio(self, pcm):
         if self.state is None:
             raise RuntimeError("No active session")
-        self.model.streaming_transcribe(pcm, self.state)
+        self.model.streaming_transcribe(to_float32(pcm), self.state)
         return {"text": self.state.text or "", "language": self.state.language}
 
     def finish(self):
@@ -62,7 +69,22 @@ class QwenWorker:
 
 
 class NemotronWorker:
+    """Cache-aware streaming inference.
+
+    Two parts of NeMo's streaming contract have to be honoured exactly or the
+    transcript degrades into cross-language gibberish: features must come from a
+    *continuous* audio stream, and the encoder must be fed the chunk, shift and
+    pre-encode-cache widths from ``streaming_cfg`` — the first step uses its own,
+    narrower set.
+    """
+
     RIGHT_CONTEXT: ClassVar = {80: 0, 160: 1, 320: 3, 560: 6, 1120: 13}
+    # A 25 ms analysis window centred on a frame reaches 1.25 hops back, so two
+    # hops of replayed audio make every emitted frame identical to the same frame
+    # computed over the whole recording at once.
+    LOOK_BACK_HOPS: ClassVar = 2
+    # The model emits an utterance-final language token, e.g. "hej där <sv-SE>".
+    LANGUAGE_TAG: ClassVar = re.compile(r"<[a-z]{2}(?:-[A-Za-z]{2,4})?>")
 
     def __init__(self, checkpoint: str):
         import nemo.collections.asr as nemo_asr
@@ -93,69 +115,164 @@ class NemotronWorker:
         cfg.preprocessor.normalize = "None"
         return EncDecCTCModelBPE.from_config_dict(cfg.preprocessor).to(self.model.device)
 
+    @staticmethod
+    def _sizes(value):
+        """Streaming widths are either one number or [first step, steady state]."""
+        return (value, value) if isinstance(value, int) else (value[0], value[1])
+
     def start(self, code, settings):
         chunk_ms = int(settings["chunk_ms"])
         left = self.model.encoder.att_context_size[0]
+        # Also recomputes streaming_cfg, so read the widths afterwards.
         self.model.encoder.set_default_att_context_size(
             [left, self.RIGHT_CONTEXT[chunk_ms]])
         if hasattr(self.model, "set_inference_prompt"):
             self.model.set_inference_prompt(language(code, "nemotron"))
         self.preprocessor = self._make_preprocessor()
-        self.chunk_samples = 16 * chunk_ms
+        streaming = self.model.encoder.streaming_cfg
+        self.chunk = self._sizes(streaming.chunk_size)
+        self.shift = self._sizes(streaming.shift_size)
+        self.pre_encode = self._sizes(streaming.pre_encode_cache_size)
+        self.minimum = self._sizes(self.model.encoder.pre_encode.get_sampling_frames())
+        self.hop = round(self.model.cfg.preprocessor.window_stride * SAMPLE_RATE)
+        self.look_back = np.zeros(self.LOOK_BACK_HOPS * self.hop, dtype=np.float32)
         self.pending = np.empty(0, dtype=np.float32)
+        self.features = self.torch.zeros(
+            (1, self.model.cfg.preprocessor.features, 0), device=self.model.device)
+        self.cursor = self.steps = 0
         self.cache_channel, self.cache_time, self.cache_len = (
             self.model.encoder.get_initial_cache_state(batch_size=1))
         self.hypotheses = self.prediction = None
-        size = self.model.encoder.streaming_cfg.pre_encode_cache_size[1]
-        features = self.model.cfg.preprocessor.features
-        self.pre_cache = self.torch.zeros(
-            (1, features, size), device=self.model.device)
         self.text = ""
         self.detected = None
 
-    def _step(self, samples, final=False):
+    def _extend_features(self):
+        """Turn whole hops of buffered audio into mel frames, with look-back."""
         torch = self.torch
-        signal = torch.from_numpy(samples).unsqueeze(0).to(self.model.device)
-        length = torch.tensor([len(samples)], device=self.model.device)
-        processed, processed_len = self.preprocessor(
-            input_signal=signal, length=length)
-        processed = torch.cat([self.pre_cache, processed], dim=-1)
-        processed_len += self.pre_cache.shape[-1]
-        self.pre_cache = processed[:, :, -self.pre_cache.shape[-1]:]
+        count = len(self.pending) // self.hop
+        if not count:
+            return
+        samples, self.pending = self.pending[:count * self.hop], self.pending[count * self.hop:]
+        segment = np.concatenate((self.look_back, samples))
+        self.look_back = segment[-self.LOOK_BACK_HOPS * self.hop:]
+        signal = torch.from_numpy(segment).unsqueeze(0).to(self.model.device)
+        length = torch.tensor([len(segment)], device=self.model.device)
         with torch.inference_mode():
-            (self.prediction, texts, self.cache_channel, self.cache_time,
-             self.cache_len, self.hypotheses) = self.model.conformer_stream_step(
-                processed_signal=processed, processed_signal_length=processed_len,
-                cache_last_channel=self.cache_channel,
-                cache_last_time=self.cache_time,
-                cache_last_channel_len=self.cache_len,
-                keep_all_outputs=final,
-                previous_hypotheses=self.hypotheses,
-                previous_pred_out=self.prediction,
-                drop_extra_pre_encoded=None, return_transcription=True)
-        value = texts[0]
-        self.text = value.text if hasattr(value, "text") else str(value)
-        if self.text.startswith("<") and ">" in self.text:
-            tag, self.text = self.text.split(">", 1)
-            self.detected = tag[1:]
-            self.text = self.text.lstrip()
+            processed, _ = self.preprocessor(input_signal=signal, length=length)
+        # Frame i of the segment is centred on hop i, so our own frames start
+        # where the look-back ends; the trailing frame is half zero-padding.
+        start = self.LOOK_BACK_HOPS
+        self.features = torch.cat([self.features, processed[:, :, start:start + count]], dim=-1)
+
+    def _decode(self, final=False):
+        torch = self.torch
+        while True:
+            step = 0 if self.steps == 0 else 1
+            width = min(self.chunk[step], self.features.shape[-1] - self.cursor)
+            if width < self.chunk[step] and not final:
+                return
+            if width < self.minimum[step]:
+                return
+            last = final and self.cursor + width >= self.features.shape[-1]
+            chunk = self.features[:, :, max(0, self.cursor - self.pre_encode[step]):
+                                  self.cursor + width]
+            length = torch.tensor([chunk.shape[-1]], device=self.model.device)
+            with torch.inference_mode():
+                (self.prediction, texts, self.cache_channel, self.cache_time,
+                 self.cache_len, self.hypotheses) = self.model.conformer_stream_step(
+                    processed_signal=chunk, processed_signal_length=length,
+                    cache_last_channel=self.cache_channel,
+                    cache_last_time=self.cache_time,
+                    cache_last_channel_len=self.cache_len,
+                    keep_all_outputs=last,
+                    previous_hypotheses=self.hypotheses,
+                    previous_pred_out=self.prediction,
+                    drop_extra_pre_encoded=None, return_transcription=True)
+            self.cursor += self.shift[step]
+            self.steps += 1
+            value = texts[0]
+            self._read(value.text if hasattr(value, "text") else str(value))
+            if last:
+                return
+
+    def _read(self, value):
+        tags = self.LANGUAGE_TAG.findall(value)
+        if tags:
+            self.detected = tags[-1][1:-1]
+        self.text = " ".join(self.LANGUAGE_TAG.sub(" ", value).split())
 
     def audio(self, pcm):
-        self.pending = np.concatenate((self.pending, pcm))
-        # Keep the newest complete chunk buffered so finish() can mark the real
-        # last chunk with keep_all_outputs=True (required to flush right context).
-        while len(self.pending) > self.chunk_samples:
-            chunk = self.pending[:self.chunk_samples]
-            self.pending = self.pending[self.chunk_samples:]
-            self._step(chunk)
+        self.pending = np.concatenate((self.pending, to_float32(pcm)))
+        self._extend_features()
+        self._decode()
         return {"text": self.text, "language": self.detected}
 
     def finish(self):
-        if len(self.pending):
-            chunk = np.pad(self.pending, (0, self.chunk_samples - len(self.pending)))
-            self._step(chunk, final=True)
-        self.pending = np.empty(0, dtype=np.float32)
+        remainder = len(self.pending) % self.hop
+        if remainder:
+            self.pending = np.concatenate(
+                (self.pending, np.zeros(self.hop - remainder, dtype=np.float32)))
+        self._extend_features()
+        # Pad out to a whole chunk so the last step can flush its right context.
+        step = 0 if self.steps == 0 else 1
+        missing = self.cursor + self.chunk[step] - self.features.shape[-1]
+        if missing > 0:
+            self.pending = np.zeros(missing * self.hop, dtype=np.float32)
+            self._extend_features()
+        self._decode(final=True)
         return {"text": self.text, "language": self.detected}
+
+
+class VoskWorker:
+    """Kaldi decoding graph; runs on CPU and streams at the native sample rate."""
+
+    def __init__(self, checkpoint: str):
+        import vosk
+
+        # Kaldi logs through the C-level stderr, which Python redirection misses.
+        vosk.SetLogLevel(-1)
+        self.vosk = vosk
+        self.model = vosk.Model(model_name=checkpoint)
+        self.recognizer = None
+
+    def metadata(self):
+        from importlib.metadata import version
+        return {"backend": "Vosk/Kaldi", "vosk": version("vosk")}
+
+    def start(self, code, settings):
+        self.recognizer = self.vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+        self.code = code
+        self.utterances = []
+
+    def _result(self, partial):
+        return {"text": " ".join([*self.utterances, partial]).strip(),
+                "language": self.code}
+
+    def _close_utterance(self, payload):
+        text = json.loads(payload)["text"]
+        if text:
+            self.utterances.append(text)
+
+    def audio(self, pcm):
+        if self.recognizer is None:
+            raise RuntimeError("No active session")
+        # A true return means silence ended the utterance: Result() is then final
+        # and the partial buffer restarts, so completed text has to be kept here.
+        if self.recognizer.AcceptWaveform(pcm):
+            self._close_utterance(self.recognizer.Result())
+            return self._result("")
+        return self._result(json.loads(self.recognizer.PartialResult())["partial"])
+
+    def finish(self):
+        if self.recognizer is None:
+            raise RuntimeError("No active session")
+        self._close_utterance(self.recognizer.FinalResult())
+        result = self._result("")
+        self.recognizer = None
+        return result
+
+
+WORKERS = {"qwen": QwenWorker, "nemotron": NemotronWorker, "vosk": VoskWorker}
 
 
 def main():
@@ -167,8 +284,7 @@ def main():
             with contextlib.redirect_stdout(sys.stderr):
                 if request["op"] == "load":
                     spec = request["model"]
-                    worker = (QwenWorker(spec["checkpoint"]) if spec["family"] == "qwen"
-                              else NemotronWorker(spec["checkpoint"]))
+                    worker = WORKERS[spec["family"]](spec["checkpoint"])
                     result = worker.metadata()
                 elif worker is None:
                     raise RuntimeError("Load a model first")
@@ -176,9 +292,7 @@ def main():
                     worker.start(request["language"], request["settings"])
                     result = {"ok": True}
                 elif request["op"] == "audio":
-                    raw_pcm = base64.b64decode(request["pcm"], validate=True)
-                    pcm = np.frombuffer(raw_pcm, dtype="<i2").astype(np.float32) / 32768.0
-                    result = worker.audio(pcm)
+                    result = worker.audio(base64.b64decode(request["pcm"], validate=True))
                 elif request["op"] == "finish":
                     result = worker.finish()
                 else:

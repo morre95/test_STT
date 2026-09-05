@@ -2,10 +2,28 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() => runApp(const SttLab());
+
+/// One entry from the backend catalog; `languages` differs per model because
+/// Vosk ships a separate decoding graph for each language.
+class ModelInfo {
+  const ModelInfo(this.id, this.name, this.languages, this.available);
+
+  factory ModelInfo.fromJson(Map<String, dynamic> m) => ModelInfo(
+      m['id'] as String,
+      m['name'] as String,
+      (m['languages'] as List).cast<String>(),
+      m['available'] == true);
+
+  final String id;
+  final String name;
+  final List<String> languages;
+  final bool available;
+}
 
 class SttLab extends StatelessWidget {
   const SttLab({super.key});
@@ -22,7 +40,11 @@ class SttLab extends StatelessWidget {
 }
 
 class LabPage extends StatefulWidget {
-  const LabPage({super.key});
+  const LabPage({super.key, this.client});
+
+  /// Injected by the widget tests; the app builds its own client.
+  final http.Client? client;
+
   @override
   State<LabPage> createState() => _LabPageState();
 }
@@ -30,6 +52,7 @@ class LabPage extends StatefulWidget {
 class _LabPageState extends State<LabPage> {
   final recorder = AudioRecorder();
   final host = TextEditingController(text: '10.0.2.2:8000');
+  late final http.Client client = widget.client ?? http.Client();
   StreamSubscription<Uint8List>? mic;
   WebSocketChannel? socket;
   bool running = false;
@@ -37,9 +60,66 @@ class _LabPageState extends State<LabPage> {
   String text = '';
   String status = 'Redo att testa';
   static const connectTimeout = Duration(seconds: 8);
-  String model = 'qwen-0.6b';
+  static const languageNames = {'sv': 'Svenska', 'en': 'English', 'auto': 'Auto'};
+  List<ModelInfo> catalog = const [];
+  String? model;
   String language = 'sv';
   double? firstMs, finalMs, rtf;
+
+  @override
+  void initState() {
+    super.initState();
+    loadModels();
+  }
+
+  String get authority {
+    final p = host.text.trim().split(':');
+    return '${p[0]}:${p.length > 1 ? p[1] : '8000'}';
+  }
+
+  ModelInfo? get selected =>
+      catalog.where((m) => m.id == model).firstOrNull;
+
+  /// The catalog is owned by the backend, so the pickers are built from it
+  /// rather than from a second list that would drift out of sync.
+  Future<void> loadModels() async {
+    setState(() => status = 'Hämtar modeller…');
+    try {
+      final response = await client
+          .get(Uri.parse('http://$authority/models'))
+          .timeout(connectTimeout);
+      if (response.statusCode != 200) {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+      final list = (jsonDecode(utf8.decode(response.bodyBytes)) as List)
+          .map((m) => ModelInfo.fromJson(m as Map<String, dynamic>))
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        catalog = list;
+        status = list.isEmpty ? 'Servern erbjuder inga modeller' : 'Redo att testa';
+        _select(catalog.where((m) => m.id == model || m.available).firstOrNull ??
+            catalog.firstOrNull);
+      });
+    } catch (e) {
+      debugPrint('Model catalog fetch failed: $e');
+      if (!mounted) return;
+      setState(() {
+        catalog = const [];
+        model = null;
+        status = 'Kunde inte hämta modeller';
+      });
+    }
+  }
+
+  /// Keeps the language valid for the model: a Vosk checkpoint accepts only its
+  /// own language, and the server rejects the run otherwise.
+  void _select(ModelInfo? choice) {
+    model = choice?.id;
+    if (choice != null && !choice.languages.contains(language)) {
+      language = choice.languages.first;
+    }
+  }
   Future<void> _beginMic() async {
     final s = await recorder.startStream(const RecordConfig(
         encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1));
@@ -61,9 +141,8 @@ class _LabPageState extends State<LabPage> {
       setState(() => status = 'Mikrofonbehörighet saknas');
       return;
     }
-    final p = host.text.split(':');
-    final channel = WebSocketChannel.connect(Uri.parse(
-        'ws://${p[0]}:${p.length > 1 ? p[1] : '8000'}/ws/transcribe'));
+    final channel =
+        WebSocketChannel.connect(Uri.parse('ws://$authority/ws/transcribe'));
     socket = channel;
     setState(() {
       loading = true;
@@ -135,6 +214,7 @@ class _LabPageState extends State<LabPage> {
     mic?.cancel();
     recorder.dispose();
     host.dispose();
+    client.close();
     super.dispose();
   }
 
@@ -159,8 +239,14 @@ class _LabPageState extends State<LabPage> {
         const SizedBox(height: 28),
         TextField(
             controller: host,
-            decoration: const InputDecoration(
-                labelText: 'FastAPI-server', prefixIcon: Icon(Icons.link))),
+            onSubmitted: (_) => loadModels(),
+            decoration: InputDecoration(
+                labelText: 'FastAPI-server',
+                prefixIcon: const Icon(Icons.link),
+                suffixIcon: IconButton(
+                    tooltip: 'Hämta modeller',
+                    onPressed: running || loading ? null : loadModels,
+                    icon: const Icon(Icons.refresh)))),
         const SizedBox(height: 16),
         Row(children: [
           Expanded(
@@ -168,29 +254,32 @@ class _LabPageState extends State<LabPage> {
                   isExpanded: true,
                   initialValue: model,
                   decoration: const InputDecoration(labelText: 'Modell'),
-                  items: const [
-                    DropdownMenuItem(
-                        value: 'qwen-0.6b', child: Text('Qwen3-ASR 0.6B')),
-                    DropdownMenuItem(
-                        value: 'qwen-1.7b', child: Text('Qwen3-ASR 1.7B')),
-                    DropdownMenuItem(
-                        value: 'nemotron-0.6b', child: Text('Nemotron 3.5 ASR'))
+                  items: [
+                    for (final m in catalog)
+                      DropdownMenuItem(
+                          value: m.id,
+                          enabled: m.available,
+                          child: Text(
+                              m.available ? m.name : '${m.name} (ej installerad)',
+                              style: TextStyle(
+                                  color: m.available ? null : Colors.grey[600])))
                   ],
-                  onChanged: running || loading
+                  onChanged: running || loading || catalog.isEmpty
                       ? null
-                      : (v) => setState(() => model = v!))),
+                      : (v) => setState(
+                          () => _select(catalog.firstWhere((m) => m.id == v))))),
           const SizedBox(width: 12),
           Expanded(
               child: DropdownButtonFormField<String>(
                   isExpanded: true,
-                  initialValue: language,
+                  initialValue: selected == null ? null : language,
                   decoration: const InputDecoration(labelText: 'Språk'),
-                  items: const [
-                    DropdownMenuItem(value: 'sv', child: Text('Svenska')),
-                    DropdownMenuItem(value: 'en', child: Text('English')),
-                    DropdownMenuItem(value: 'auto', child: Text('Auto'))
+                  items: [
+                    for (final code in selected?.languages ?? const <String>[])
+                      DropdownMenuItem(
+                          value: code, child: Text(languageNames[code] ?? code))
                   ],
-                  onChanged: running || loading
+                  onChanged: running || loading || selected == null
                       ? null
                       : (v) => setState(() => language = v!)))
         ]),
@@ -208,7 +297,9 @@ class _LabPageState extends State<LabPage> {
         Row(children: [
           Expanded(
               child: FilledButton.icon(
-                  onPressed: loading ? null : (running ? stop : start),
+                  onPressed: loading || (model == null && !running)
+                      ? null
+                      : (running ? stop : start),
                   icon: Icon(running ? Icons.stop : Icons.mic),
                   label: Text(loading
                       ? 'LADDAR…'

@@ -40,13 +40,24 @@ class ClientMetrics(BaseModel):
     finalization_ms: float | None = Field(default=None, ge=0, le=600000)
 
 
+# Vosk decodes every frame it is given, so it exposes no streaming tunables.
+SETTING_CHOICES = {
+    "qwen": {"chunk_seconds": (0.5, 1, 2, 3)},
+    "nemotron": {"chunk_ms": (80, 160, 320, 560, 1120)},
+    "vosk": {},
+}
+
+
 def validated_settings(spec, settings):
     settings = {**spec["defaults"], **settings}
-    if spec["family"] == "qwen":
-        if set(settings) != {"chunk_seconds"} or settings["chunk_seconds"] not in (0.5, 1, 2, 3):
-            raise ValueError("Qwen chunk_seconds must be 0.5, 1, 2 or 3")
-    elif set(settings) != {"chunk_ms"} or settings["chunk_ms"] not in (80, 160, 320, 560, 1120):
-        raise ValueError("Nemotron chunk_ms must be 80, 160, 320, 560 or 1120")
+    choices = SETTING_CHOICES[spec["family"]]
+    if set(settings) != set(choices):
+        raise ValueError(f"{spec['family']} accepts exactly these settings: "
+                         f"{', '.join(choices) or 'none'}")
+    for key, allowed in choices.items():
+        if settings[key] not in allowed:
+            raise ValueError(f"{key} must be one of "
+                             f"{', '.join(str(value) for value in allowed)}")
     return settings
 
 
@@ -128,6 +139,9 @@ def create_app(data_dir=None, runtime=None, catalog=None):
             if start.model not in catalog:
                 raise ValueError("Unknown model")
             spec = catalog[start.model]
+            if start.language not in spec["languages"]:
+                raise ValueError(f"{spec['name']} only supports "
+                                 f"{', '.join(spec['languages'])}")
             settings = validated_settings(spec, start.settings)
             replay = start.recording_id is not None
             if replay:
