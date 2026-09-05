@@ -36,6 +36,7 @@ class _LabPageState extends State<LabPage> {
   bool loading = false;
   String text = '';
   String status = 'Redo att testa';
+  static const connectTimeout = Duration(seconds: 8);
   String model = 'qwen-0.6b';
   String language = 'sv';
   double? firstMs, finalMs, rtf;
@@ -61,9 +62,29 @@ class _LabPageState extends State<LabPage> {
       return;
     }
     final p = host.text.split(':');
-    socket = WebSocketChannel.connect(Uri.parse(
+    final channel = WebSocketChannel.connect(Uri.parse(
         'ws://${p[0]}:${p.length > 1 ? p[1] : '8000'}/ws/transcribe'));
-    socket!.stream.listen((e) async {
+    socket = channel;
+    setState(() {
+      loading = true;
+      status = 'Ansluter…';
+      text = '';
+      firstMs = finalMs = rtf = null;
+    });
+    try {
+      await channel.ready.timeout(connectTimeout);
+    } catch (e) {
+      debugPrint('WebSocket connect failed: $e');
+      await channel.sink.close();
+      if (!mounted) return;
+      setState(() {
+        socket = null;
+        status = 'Kunde inte ansluta';
+        loading = false;
+      });
+      return;
+    }
+    channel.stream.listen((e) async {
       final m = jsonDecode(e);
       if (m['type'] == 'loading') setState(() => status = 'Laddar modell…');
       if (m['type'] == 'ready') await _beginMic();
@@ -86,24 +107,20 @@ class _LabPageState extends State<LabPage> {
           loading = false;
         });
       }
-    },
-        onError: (_) => setState(() {
-              status = 'Kunde inte ansluta';
-              running = false;
-              loading = false;
-            }));
-    socket!.sink.add(jsonEncode({
+    }, onError: (e) {
+      debugPrint('WebSocket stream error: $e');
+      setState(() {
+        status = 'Anslutningen bröts';
+        running = false;
+        loading = false;
+      });
+    });
+    channel.sink.add(jsonEncode({
       'type': 'start',
       'model': model,
       'language': language,
       'settings': {}
     }));
-    setState(() {
-      loading = true;
-      status = 'Ansluter…';
-      text = '';
-      firstMs = finalMs = rtf = null;
-    });
   }
 
   Future<void> stop() async {
