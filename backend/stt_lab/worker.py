@@ -5,6 +5,7 @@ import base64
 import contextlib
 import copy
 import json
+import os
 import re
 import sys
 import time
@@ -14,6 +15,36 @@ from typing import Any, ClassVar
 import numpy as np
 
 SAMPLE_RATE = 16000
+GIB = 1024 ** 3
+
+
+def qwen_gpu_memory_utilization(free_bytes: int, total_bytes: int) -> float:
+    """Choose a vLLM budget that fits the GPU's *currently free* memory.
+
+    vLLM interprets ``gpu_memory_utilization`` as a fraction of total VRAM and
+    rejects startup when that absolute amount is not free. A fixed value is
+    therefore brittle on a desktop GPU shared with the compositor, browser and
+    emulator. Keep one GiB free by default and cap the model at 82% of VRAM.
+    Both values can be overridden for dedicated inference machines.
+    """
+    try:
+        cap = float(os.environ.get("STT_QWEN_GPU_MEMORY_UTILIZATION", "0.82"))
+        headroom_gib = float(os.environ.get("STT_QWEN_GPU_HEADROOM_GIB", "1.0"))
+    except ValueError as exc:
+        raise RuntimeError("Qwen GPU memory settings must be numbers") from exc
+    if not 0 < cap <= 1:
+        raise RuntimeError("STT_QWEN_GPU_MEMORY_UTILIZATION must be between 0 and 1")
+    if headroom_gib < 0:
+        raise RuntimeError("STT_QWEN_GPU_HEADROOM_GIB cannot be negative")
+    if total_bytes <= 0:
+        raise RuntimeError("CUDA reported invalid total GPU memory")
+
+    usable = (free_bytes - headroom_gib * GIB) / total_bytes
+    if usable <= 0:
+        raise RuntimeError(
+            f"Qwen needs more free GPU memory (configured headroom: {headroom_gib:g} GiB)"
+        )
+    return min(cap, usable)
 
 
 def reply(payload: dict[str, Any]) -> None:
@@ -33,10 +64,16 @@ def language(code: str, family: str) -> str | None:
 
 class QwenWorker:
     def __init__(self, checkpoint: str):
+        import torch
         from qwen_asr import Qwen3ASRModel
 
+        if not torch.cuda.is_available():
+            raise RuntimeError("Qwen requires a working CUDA device")
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        self.gpu_memory_utilization = qwen_gpu_memory_utilization(free_bytes, total_bytes)
+
         self.model = Qwen3ASRModel.LLM(
-            model=checkpoint, gpu_memory_utilization=0.82,
+            model=checkpoint, gpu_memory_utilization=self.gpu_memory_utilization,
             max_inference_batch_size=1, max_new_tokens=256,
         )
         self.state = None
@@ -44,7 +81,8 @@ class QwenWorker:
     def metadata(self):
         import qwen_asr
         return {"backend": "qwen-asr/vLLM",
-                "qwen_asr": getattr(qwen_asr, "__version__", "unknown")}
+                "qwen_asr": getattr(qwen_asr, "__version__", "unknown"),
+                "gpu_memory_utilization": self.gpu_memory_utilization}
 
     def start(self, code, settings):
         self.state = self.model.init_streaming_state(

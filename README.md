@@ -35,6 +35,11 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 
 Modellvikterna hämtas första gången modellen väljs: Qwen och Nemotron från Hugging Face, Vosk från alphacephei.com till `~/.cache/vosk`. Qwen använder officiell vLLM-streaming, Nemotron använder NeMos cache-aware RNNT-streaming och Vosk streamar via Kaldi på CPU. Endast en modell är laddad åt gången.
 
+Qwen anpassar automatiskt vLLM:s minnesbudget efter ledigt VRAM och lämnar
+1 GiB marginal för skrivbordet. På en dedikerad GPU kan gränserna styras med
+`STT_QWEN_GPU_MEMORY_UTILIZATION` (andel av totalt VRAM, högst `1`) och
+`STT_QWEN_GPU_HEADROOM_GIB`.
+
 Talarbenchmarken använder en separat miljö eftersom PyTorch, ModelScope,
 3D-Speaker, Silero VAD och ONNX Runtime är betydligt tyngre än API-servern.
 Installera en CUDA-matchad `torch`/`torchaudio`-kombination i
