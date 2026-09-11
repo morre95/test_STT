@@ -149,4 +149,34 @@ void main() {
     expect(find.text('Inga röster registrerade ännu.'), findsOneWidget);
     expect(find.text('NY PROFIL'), findsOneWidget);
   });
+
+  testWidgets('facittalardialogen kan stängas utan controller-krasch',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(800, 1200));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final client = MockClient((request) async {
+      final body = switch (request.url.path) {
+        '/recordings' ||
+        '/speaker-profiles' ||
+        '/speaker-models' ||
+        '/models' =>
+          const [],
+        _ => throw StateError('Unexpected ${request.url.path}')
+      };
+      return http.Response(jsonEncode(body), 200,
+          headers: {'content-type': 'application/json; charset=utf-8'});
+    });
+    await tester
+        .pumpWidget(MaterialApp(home: SpeakerBenchmarkPage(client: client)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('TALARE'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).last, 'Ada');
+    await tester.tap(find.text('LÄGG TILL'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Ada'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }

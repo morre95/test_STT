@@ -290,7 +290,7 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
   }
 
   Future<void> addSpeaker() async {
-    final name = TextEditingController();
+    var name = '';
     String? profileId;
     final value = await showDialog<Map<String, dynamic>>(
         context: context,
@@ -299,8 +299,8 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
                     title: const Text('Ny facittalare'),
                     content: Column(mainAxisSize: MainAxisSize.min, children: [
                       TextField(
-                          controller: name,
                           autofocus: true,
+                          onChanged: (value) => name = value,
                           decoration: const InputDecoration(labelText: 'Namn')),
                       const SizedBox(height: 12),
                       DropdownButtonFormField<String?>(
@@ -323,17 +323,16 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
                           child: const Text('AVBRYT')),
                       FilledButton(
                           onPressed: () {
-                            if (name.text.trim().isEmpty) return;
+                            if (name.trim().isEmpty) return;
                             Navigator.pop(dialogContext, {
                               'id':
                                   'speaker-${DateTime.now().microsecondsSinceEpoch}',
-                              'label': name.text.trim(),
+                              'label': name.trim(),
                               'profile_id': profileId
                             });
                           },
                           child: const Text('LÄGG TILL'))
                     ])));
-    name.dispose();
     if (value != null) setState(() => speakers.add(value));
   }
 
@@ -342,14 +341,12 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
       setState(() => status = 'Lägg först till en facittalare');
       return;
     }
-    final begin = TextEditingController(
-        text: (player.position.inMilliseconds / 1000).toStringAsFixed(2));
-    final finish = TextEditingController(
-        text: ((player.position.inMilliseconds + 2000)
-                    .clamp(0, (selectedRecording?.duration ?? 2) * 1000) /
-                1000)
-            .toStringAsFixed(2));
-    final words = TextEditingController();
+    var begin = (player.position.inMilliseconds / 1000).toStringAsFixed(2);
+    var finish = ((player.position.inMilliseconds + 2000)
+                .clamp(0, (selectedRecording?.duration ?? 2) * 1000) /
+            1000)
+        .toStringAsFixed(2);
+    var words = '';
     String speakerId = speakers.first['id'] as String;
     final value = await showDialog<Map<String, dynamic>>(
         context: context,
@@ -373,22 +370,24 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
                       const SizedBox(height: 12),
                       Row(children: [
                         Expanded(
-                            child: TextField(
-                                controller: begin,
+                            child: TextFormField(
+                                initialValue: begin,
+                                onChanged: (value) => begin = value,
                                 keyboardType: TextInputType.number,
                                 decoration: const InputDecoration(
                                     labelText: 'Start (s)'))),
                         const SizedBox(width: 8),
                         Expanded(
-                            child: TextField(
-                                controller: finish,
+                            child: TextFormField(
+                                initialValue: finish,
+                                onChanged: (value) => finish = value,
                                 keyboardType: TextInputType.number,
                                 decoration: const InputDecoration(
                                     labelText: 'Slut (s)')))
                       ]),
                       const SizedBox(height: 12),
-                      TextField(
-                          controller: words,
+                      TextFormField(
+                          onChanged: (value) => words = value,
                           minLines: 2,
                           maxLines: 5,
                           decoration:
@@ -400,29 +399,26 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
                           child: const Text('AVBRYT')),
                       FilledButton(
                           onPressed: () {
-                            final start = double.tryParse(
-                                begin.text.replaceAll(',', '.'));
-                            final end = double.tryParse(
-                                finish.text.replaceAll(',', '.'));
+                            final start =
+                                double.tryParse(begin.replaceAll(',', '.'));
+                            final end =
+                                double.tryParse(finish.replaceAll(',', '.'));
                             if (start == null ||
                                 end == null ||
                                 start < 0 ||
                                 end <= start ||
-                                words.text.trim().isEmpty) {
+                                words.trim().isEmpty) {
                               return;
                             }
                             Navigator.pop(dialogContext, {
                               'start_ms': (start * 1000).round(),
                               'end_ms': (end * 1000).round(),
                               'speaker_id': speakerId,
-                              'text': words.text.trim()
+                              'text': words.trim()
                             });
                           },
                           child: const Text('LÄGG TILL'))
                     ])));
-    begin.dispose();
-    finish.dispose();
-    words.dispose();
     if (value != null) {
       setState(() {
         segments.add(value);
@@ -951,14 +947,14 @@ class _SpeakerProfilesPageState extends State<SpeakerProfilesPage> {
   }
 
   Future<void> createProfile() async {
-    final controller = TextEditingController();
+    var value = '';
     final name = await showDialog<String>(
         context: context,
         builder: (dialogContext) => AlertDialog(
                 title: const Text('Ny talarprofil'),
                 content: TextField(
-                    controller: controller,
                     autofocus: true,
+                    onChanged: (next) => value = next,
                     decoration: const InputDecoration(labelText: 'Namn')),
                 actions: [
                   TextButton(
@@ -966,10 +962,9 @@ class _SpeakerProfilesPageState extends State<SpeakerProfilesPage> {
                       child: const Text('AVBRYT')),
                   FilledButton(
                       onPressed: () =>
-                          Navigator.pop(dialogContext, controller.text.trim()),
+                          Navigator.pop(dialogContext, value.trim()),
                       child: const Text('SKAPA'))
                 ]));
-    controller.dispose();
     if (name == null || name.isEmpty) return;
     final response = await client.post(serverUri(host, '/speaker-profiles'),
         headers: {'content-type': 'application/json'},
