@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'speaker_lab.dart';
 
 void main() => runApp(const SttLab());
 
@@ -34,16 +35,69 @@ class SttLab extends StatelessWidget {
           useMaterial3: true,
           brightness: Brightness.dark,
           scaffoldBackgroundColor: const Color(0xff101417),
+          fontFamily: 'monospace',
           colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xffd6f36b), brightness: Brightness.dark)),
-      home: const LabPage());
+              seedColor: const Color(0xffd6f36b), brightness: Brightness.dark),
+          cardTheme: const CardThemeData(
+              color: Color(0xff171d20),
+              margin: EdgeInsets.zero,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.all(Radius.circular(14)),
+                  side: BorderSide(color: Color(0xff303a38))))),
+      home: const LabShell());
+}
+
+class LabShell extends StatefulWidget {
+  const LabShell({super.key});
+
+  @override
+  State<LabShell> createState() => _LabShellState();
+}
+
+class _LabShellState extends State<LabShell> {
+  int index = 0;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+      appBar: AppBar(
+          title: const Row(children: [
+            Icon(Icons.graphic_eq, color: Color(0xffd6f36b)),
+            SizedBox(width: 10),
+            Text('LOCAL STT LAB',
+                style:
+                    TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.4))
+          ]),
+          actions: const [
+            Padding(
+                padding: EdgeInsets.only(right: 18),
+                child: Center(
+                    child: Text('16 kHz · LOCAL',
+                        style:
+                            TextStyle(color: Color(0xff84908f), fontSize: 11))))
+          ]),
+      body: IndexedStack(index: index, children: const [
+        LabPage(embedded: true),
+        SpeakerBenchmarkPage(),
+        SpeakerProfilesPage(),
+      ]),
+      bottomNavigationBar: NavigationBar(
+          selectedIndex: index,
+          onDestinationSelected: (value) => setState(() => index = value),
+          destinations: const [
+            NavigationDestination(icon: Icon(Icons.mic_none), label: 'STT'),
+            NavigationDestination(
+                icon: Icon(Icons.spatial_audio_off), label: 'Talare'),
+            NavigationDestination(
+                icon: Icon(Icons.badge_outlined), label: 'Profiler'),
+          ]));
 }
 
 class LabPage extends StatefulWidget {
-  const LabPage({super.key, this.client});
+  const LabPage({super.key, this.client, this.embedded = false});
 
   /// Injected by the widget tests; the app builds its own client.
   final http.Client? client;
+  final bool embedded;
 
   @override
   State<LabPage> createState() => _LabPageState();
@@ -60,7 +114,11 @@ class _LabPageState extends State<LabPage> {
   String text = '';
   String status = 'Redo att testa';
   static const connectTimeout = Duration(seconds: 8);
-  static const languageNames = {'sv': 'Svenska', 'en': 'English', 'auto': 'Auto'};
+  static const languageNames = {
+    'sv': 'Svenska',
+    'en': 'English',
+    'auto': 'Auto'
+  };
   List<ModelInfo> catalog = const [];
   String? model;
   String language = 'sv';
@@ -77,8 +135,7 @@ class _LabPageState extends State<LabPage> {
     return '${p[0]}:${p.length > 1 ? p[1] : '8000'}';
   }
 
-  ModelInfo? get selected =>
-      catalog.where((m) => m.id == model).firstOrNull;
+  ModelInfo? get selected => catalog.where((m) => m.id == model).firstOrNull;
 
   /// The catalog is owned by the backend, so the pickers are built from it
   /// rather than from a second list that would drift out of sync.
@@ -97,9 +154,11 @@ class _LabPageState extends State<LabPage> {
       if (!mounted) return;
       setState(() {
         catalog = list;
-        status = list.isEmpty ? 'Servern erbjuder inga modeller' : 'Redo att testa';
-        _select(catalog.where((m) => m.id == model || m.available).firstOrNull ??
-            catalog.firstOrNull);
+        status =
+            list.isEmpty ? 'Servern erbjuder inga modeller' : 'Redo att testa';
+        _select(
+            catalog.where((m) => m.id == model || m.available).firstOrNull ??
+                catalog.firstOrNull);
       });
     } catch (e) {
       debugPrint('Model catalog fetch failed: $e');
@@ -120,6 +179,7 @@ class _LabPageState extends State<LabPage> {
       language = choice.languages.first;
     }
   }
+
   Future<void> _beginMic() async {
     final s = await recorder.startStream(const RecordConfig(
         encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1));
@@ -219,107 +279,110 @@ class _LabPageState extends State<LabPage> {
   }
 
   @override
-  Widget build(BuildContext c) => Scaffold(
-      appBar: AppBar(title: const Text('LOCAL STT LAB'), actions: [
-        Padding(
-            padding: const EdgeInsets.all(16),
-            child: Text(status,
-                style: TextStyle(
-                    color: running ? Colors.orange : const Color(0xffd6f36b))))
+  Widget build(BuildContext c) {
+    final content = ListView(padding: const EdgeInsets.all(24), children: [
+      Align(
+          alignment: Alignment.centerRight,
+          child: Text(status,
+              style: TextStyle(
+                  color: running ? Colors.orange : const Color(0xffd6f36b),
+                  fontSize: 12))),
+      Text('Lyssna. Mät. Jämför.',
+          style: Theme.of(c)
+              .textTheme
+              .headlineMedium
+              ?.copyWith(fontWeight: FontWeight.w800)),
+      const SizedBox(height: 8),
+      Text('En lokal arbetsbänk för svenska och engelska talmodeller.',
+          style: TextStyle(color: Colors.grey[400])),
+      const SizedBox(height: 28),
+      TextField(
+          controller: host,
+          onSubmitted: (_) => loadModels(),
+          decoration: InputDecoration(
+              labelText: 'FastAPI-server',
+              prefixIcon: const Icon(Icons.link),
+              suffixIcon: IconButton(
+                  tooltip: 'Hämta modeller',
+                  onPressed: running || loading ? null : loadModels,
+                  icon: const Icon(Icons.refresh)))),
+      const SizedBox(height: 16),
+      Row(children: [
+        Expanded(
+            child: DropdownButtonFormField<String>(
+                isExpanded: true,
+                initialValue: model,
+                decoration: const InputDecoration(labelText: 'Modell'),
+                items: [
+                  for (final m in catalog)
+                    DropdownMenuItem(
+                        value: m.id,
+                        enabled: m.available,
+                        child: Text(
+                            m.available ? m.name : '${m.name} (ej installerad)',
+                            style: TextStyle(
+                                color: m.available ? null : Colors.grey[600])))
+                ],
+                onChanged: running || loading || catalog.isEmpty
+                    ? null
+                    : (v) => setState(
+                        () => _select(catalog.firstWhere((m) => m.id == v))))),
+        const SizedBox(width: 12),
+        Expanded(
+            child: DropdownButtonFormField<String>(
+                isExpanded: true,
+                initialValue: selected == null ? null : language,
+                decoration: const InputDecoration(labelText: 'Språk'),
+                items: [
+                  for (final code in selected?.languages ?? const <String>[])
+                    DropdownMenuItem(
+                        value: code, child: Text(languageNames[code] ?? code))
+                ],
+                onChanged: running || loading || selected == null
+                    ? null
+                    : (v) => setState(() => language = v!)))
       ]),
-      body: ListView(padding: const EdgeInsets.all(24), children: [
-        Text('Lyssna. Mät. Jämför.',
-            style: Theme.of(c)
-                .textTheme
-                .headlineMedium
-                ?.copyWith(fontWeight: FontWeight.w800)),
-        const SizedBox(height: 8),
-        Text('En lokal arbetsbänk för svenska och engelska talmodeller.',
-            style: TextStyle(color: Colors.grey[400])),
-        const SizedBox(height: 28),
-        TextField(
-            controller: host,
-            onSubmitted: (_) => loadModels(),
-            decoration: InputDecoration(
-                labelText: 'FastAPI-server',
-                prefixIcon: const Icon(Icons.link),
-                suffixIcon: IconButton(
-                    tooltip: 'Hämta modeller',
-                    onPressed: running || loading ? null : loadModels,
-                    icon: const Icon(Icons.refresh)))),
-        const SizedBox(height: 16),
-        Row(children: [
-          Expanded(
-              child: DropdownButtonFormField<String>(
-                  isExpanded: true,
-                  initialValue: model,
-                  decoration: const InputDecoration(labelText: 'Modell'),
-                  items: [
-                    for (final m in catalog)
-                      DropdownMenuItem(
-                          value: m.id,
-                          enabled: m.available,
-                          child: Text(
-                              m.available ? m.name : '${m.name} (ej installerad)',
-                              style: TextStyle(
-                                  color: m.available ? null : Colors.grey[600])))
-                  ],
-                  onChanged: running || loading || catalog.isEmpty
-                      ? null
-                      : (v) => setState(
-                          () => _select(catalog.firstWhere((m) => m.id == v))))),
-          const SizedBox(width: 12),
-          Expanded(
-              child: DropdownButtonFormField<String>(
-                  isExpanded: true,
-                  initialValue: selected == null ? null : language,
-                  decoration: const InputDecoration(labelText: 'Språk'),
-                  items: [
-                    for (final code in selected?.languages ?? const <String>[])
-                      DropdownMenuItem(
-                          value: code, child: Text(languageNames[code] ?? code))
-                  ],
-                  onChanged: running || loading || selected == null
-                      ? null
-                      : (v) => setState(() => language = v!)))
-        ]),
-        const SizedBox(height: 24),
-        Container(
-            padding: const EdgeInsets.all(22),
-            decoration: BoxDecoration(
-                color: const Color(0xff1a2023),
-                borderRadius: BorderRadius.circular(18),
-                border: Border.all(color: const Color(0xff303a38))),
-            child: Text(text.isEmpty ? 'Tryck start och tala naturligt.' : text,
-                style:
-                    Theme.of(c).textTheme.titleLarge?.copyWith(height: 1.5))),
-        const SizedBox(height: 20),
-        Row(children: [
-          Expanded(
-              child: FilledButton.icon(
-                  onPressed: loading || (model == null && !running)
-                      ? null
-                      : (running ? stop : start),
-                  icon: Icon(running ? Icons.stop : Icons.mic),
-                  label: Text(loading
-                      ? 'LADDAR…'
-                      : running
-                          ? 'STOPPA'
-                          : 'STARTA TEST'))),
-          const SizedBox(width: 12),
-          IconButton(
-              onPressed: () => setState(() => text = ''),
-              icon: const Icon(Icons.delete_outline))
-        ]),
-        const SizedBox(height: 26),
-        Wrap(spacing: 12, runSpacing: 12, children: [
-          _metric(
-              'Första text', firstMs == null ? '—' : '${firstMs!.round()} ms'),
-          _metric(
-              'Slutresultat', finalMs == null ? '—' : '${finalMs!.round()} ms'),
-          _metric('RTF', rtf == null ? '—' : rtf!.toStringAsFixed(2))
-        ])
-      ]));
+      const SizedBox(height: 24),
+      Container(
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+              color: const Color(0xff1a2023),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: const Color(0xff303a38))),
+          child: Text(text.isEmpty ? 'Tryck start och tala naturligt.' : text,
+              style: Theme.of(c).textTheme.titleLarge?.copyWith(height: 1.5))),
+      const SizedBox(height: 20),
+      Row(children: [
+        Expanded(
+            child: FilledButton.icon(
+                onPressed: loading || (model == null && !running)
+                    ? null
+                    : (running ? stop : start),
+                icon: Icon(running ? Icons.stop : Icons.mic),
+                label: Text(loading
+                    ? 'LADDAR…'
+                    : running
+                        ? 'STOPPA'
+                        : 'STARTA TEST'))),
+        const SizedBox(width: 12),
+        IconButton(
+            onPressed: () => setState(() => text = ''),
+            icon: const Icon(Icons.delete_outline))
+      ]),
+      const SizedBox(height: 26),
+      Wrap(spacing: 12, runSpacing: 12, children: [
+        _metric(
+            'Första text', firstMs == null ? '—' : '${firstMs!.round()} ms'),
+        _metric(
+            'Slutresultat', finalMs == null ? '—' : '${finalMs!.round()} ms'),
+        _metric('RTF', rtf == null ? '—' : rtf!.toStringAsFixed(2))
+      ])
+    ]);
+    if (widget.embedded) return content;
+    return Scaffold(
+        appBar: AppBar(title: const Text('LOCAL STT LAB')), body: content);
+  }
+
   Widget _metric(String a, String b) => Container(
       width: 150,
       padding: const EdgeInsets.all(14),

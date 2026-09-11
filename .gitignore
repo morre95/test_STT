@@ -6,4 +6,5 @@ __pycache__/
 backend/data/
 backend/.env
 backend/runtime-locks/
+backend/runtime-models/
 *.log

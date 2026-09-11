@@ -3,7 +3,14 @@ name = "stt-lab-backend"
 version = "0.1.0"
 description = "Local streaming speech recognition evaluation lab"
 requires-python = ">=3.11,<3.14"
-dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1", "jiwer>=4,<5"]
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "jiwer>=4,<5",
+    "numpy>=2,<3",
+    "python-multipart>=0.0.20,<1",
+    "soundfile>=0.13,<1",
+]
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "httpx2>=2.12,<3", "ruff>=0.11"]

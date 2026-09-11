@@ -6,20 +6,23 @@ import wave
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .audio import AudioValidationError, normalize_audio, receive_upload
 from .catalog import models, public_models
 from .runtime import Runtime
+from .speaker_catalog import public_speaker_models, speaker_models
+from .speaker_jobs import SpeakerJobs
 from .store import Store
 
 BYTES_PER_SECOND = 32000
 FRAME_BYTES = 3200
-MAX_SECONDS = 300
+MAX_SECONDS = 3600
 
 
 class Start(BaseModel):
@@ -38,6 +41,42 @@ class Reference(BaseModel):
 class ClientMetrics(BaseModel):
     first_text_ms: float | None = Field(default=None, ge=0, le=600000)
     finalization_ms: float | None = Field(default=None, ge=0, le=600000)
+
+
+class ReferenceSpeaker(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=100)
+    profile_id: str | None = None
+
+
+class ReferenceSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    speaker_id: str
+    text: str = Field(min_length=1, max_length=10000)
+
+
+class SpeakerReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    speakers: list[ReferenceSpeaker] = Field(min_length=1, max_length=100)
+    segments: list[ReferenceSegment] = Field(min_length=1, max_length=10000)
+
+
+class ProfileCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=100)
+
+
+class SpeakerBenchmarkStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recording_id: str
+    embedding_models: list[str] = Field(min_length=1, max_length=20)
+    stt_model: str
+    language: Literal["sv", "en", "auto"] = "sv"
+    speaker_count: int | None = Field(default=None, ge=1, le=20)
+    thresholds: dict[str, float] = Field(default_factory=dict)
 
 
 # Vosk decodes every frame it is given, so it exposes no streaming tunables.
@@ -61,32 +100,63 @@ def validated_settings(spec, settings):
     return settings
 
 
-def create_app(data_dir=None, runtime=None, catalog=None):
+def create_app(data_dir=None, runtime=None, catalog=None, embedding_catalog=None,
+               speaker_runtime_factory=None):
     data_dir = Path(data_dir or os.environ.get("STT_DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
     store = Store(data_dir)
     engine = runtime or Runtime(data_dir)
     catalog = catalog or models()
+    embedding_catalog = embedding_catalog or speaker_models()
     busy = asyncio.Lock()
+    jobs = SpeakerJobs(store, embedding_catalog, catalog, engine, busy,
+                       **({"runtime_factory": speaker_runtime_factory}
+                          if speaker_runtime_factory else {}))
 
     @asynccontextmanager
     async def lifespan(app):
         yield
+        await jobs.close()
         await engine.close()
 
     app = FastAPI(title="STT Lab", lifespan=lifespan)
     app.state.store = store
+    app.state.speaker_jobs = jobs
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "busy": busy.locked(), "active_model": engine.model_id}
+        return {"status": "ok", "busy": busy.locked(), "active_model": engine.model_id,
+                "active_speaker_jobs": len(jobs.tasks)}
 
     @app.get("/models")
     async def model_list():
         return public_models(catalog)
 
+    @app.get("/speaker-models")
+    async def speaker_model_list():
+        return public_speaker_models(embedding_catalog)
+
     @app.get("/recordings")
     async def recordings():
         return store.history()
+
+    @app.post("/recordings/upload", status_code=201)
+    async def upload_recording(file: Annotated[UploadFile, File()]):
+        temporary = normalized = None
+        try:
+            temporary = await receive_upload(file, data_dir)
+            normalized = temporary.with_suffix(".normalized.wav")
+            duration = normalize_audio(temporary, normalized)
+            ident = store.create_recording(source="upload", original_name=file.filename)
+            normalized.replace(store.audio_path(ident))
+            store.finish_recording(ident, duration, True)
+            return store.recording(ident)
+        except AudioValidationError as exc:
+            raise HTTPException(422, str(exc)) from None
+        finally:
+            if temporary:
+                temporary.unlink(missing_ok=True)
+            if normalized:
+                normalized.unlink(missing_ok=True)
 
     @app.get("/recordings/{ident}/audio")
     async def audio(ident: str):
@@ -105,6 +175,161 @@ def create_app(data_dir=None, runtime=None, catalog=None):
         except KeyError:
             raise HTTPException(404, "Recording not found") from None
         return {"ok": True}
+
+    @app.put("/recordings/{ident}/speaker-reference")
+    async def speaker_reference(ident: str, body: SpeakerReference):
+        try:
+            recording = store.recording(ident)
+        except KeyError:
+            raise HTTPException(404, "Recording not found") from None
+        speaker_ids = [item.id for item in body.speakers]
+        if len(set(speaker_ids)) != len(speaker_ids):
+            raise HTTPException(422, "Speaker ids must be unique")
+        known_profiles = {item["id"] for item in store.profiles()}
+        for speaker in body.speakers:
+            if speaker.profile_id and speaker.profile_id not in known_profiles:
+                raise HTTPException(422, f"Unknown profile: {speaker.profile_id}")
+        duration_ms = round(recording["duration"] * 1000)
+        by_speaker = {}
+        for segment in sorted(body.segments, key=lambda item: (item.speaker_id, item.start_ms)):
+            if segment.speaker_id not in speaker_ids:
+                raise HTTPException(422, f"Unknown reference speaker: {segment.speaker_id}")
+            if segment.start_ms >= segment.end_ms or segment.end_ms > duration_ms:
+                raise HTTPException(422, "Reference segment is outside the recording")
+            previous_end = by_speaker.get(segment.speaker_id, -1)
+            if segment.start_ms < previous_end:
+                raise HTTPException(422, "One speaker cannot have overlapping segments")
+            by_speaker[segment.speaker_id] = segment.end_ms
+        data = body.model_dump()
+        store.set_speaker_reference(ident, data)
+        return data
+
+    @app.get("/speaker-profiles")
+    async def profile_list():
+        return store.profiles()
+
+    @app.post("/speaker-profiles", status_code=201)
+    async def create_profile(body: ProfileCreate):
+        name = " ".join(body.name.split())
+        if any(item["name"].casefold() == name.casefold() for item in store.profiles()):
+            raise HTTPException(409, "A speaker profile with that name already exists")
+        return store.create_profile(name)
+
+    @app.get("/speaker-profiles/{ident}")
+    async def get_profile(ident: str):
+        try:
+            return store.profile(ident)
+        except KeyError:
+            raise HTTPException(404, "Speaker profile not found") from None
+
+    @app.put("/speaker-profiles/{ident}")
+    async def update_profile(ident: str, body: ProfileCreate):
+        name = " ".join(body.name.split())
+        if any(item["id"] != ident and item["name"].casefold() == name.casefold()
+               for item in store.profiles()):
+            raise HTTPException(409, "A speaker profile with that name already exists")
+        try:
+            return store.update_profile(ident, name)
+        except KeyError:
+            raise HTTPException(404, "Speaker profile not found") from None
+
+    @app.delete("/speaker-profiles/{ident}")
+    async def delete_profile(ident: str):
+        try:
+            profile = store.profile(ident)
+            paths = [store.profile_sample_path(ident, item["id"])
+                     for item in profile["samples"]]
+            store.delete_profile(ident)
+        except KeyError:
+            raise HTTPException(404, "Speaker profile not found") from None
+        for path in paths:
+            path.unlink(missing_ok=True)
+        return {"ok": True}
+
+    @app.post("/speaker-profiles/{ident}/samples", status_code=201)
+    async def add_profile_sample(ident: str, file: Annotated[UploadFile, File()]):
+        try:
+            store.profile(ident)
+        except KeyError:
+            raise HTTPException(404, "Speaker profile not found") from None
+        temporary = normalized = None
+        try:
+            temporary = await receive_upload(file, data_dir)
+            normalized = temporary.with_suffix(".normalized.wav")
+            duration = normalize_audio(temporary, normalized, max_seconds=60)
+            if duration < 2:
+                raise AudioValidationError("A profile sample must be at least two seconds")
+            sample = store.add_profile_sample(ident, duration, file.filename)
+            normalized.replace(store.profile_sample_path(ident, sample["id"]))
+            return sample
+        except AudioValidationError as exc:
+            raise HTTPException(422, str(exc)) from None
+        finally:
+            if temporary:
+                temporary.unlink(missing_ok=True)
+            if normalized:
+                normalized.unlink(missing_ok=True)
+
+    @app.delete("/speaker-profiles/{profile_id}/samples/{sample_id}")
+    async def delete_profile_sample(profile_id: str, sample_id: str):
+        try:
+            path = store.profile_sample_path(profile_id, sample_id)
+            store.delete_profile_sample(sample_id)
+        except KeyError:
+            raise HTTPException(404, "Speaker sample not found") from None
+        path.unlink(missing_ok=True)
+        return {"ok": True}
+
+    @app.get("/speaker-benchmarks")
+    async def speaker_benchmark_list():
+        return store.speaker_jobs()
+
+    @app.post("/speaker-benchmarks", status_code=202)
+    async def start_speaker_benchmark(body: SpeakerBenchmarkStart):
+        try:
+            recording = store.recording(body.recording_id)
+        except KeyError:
+            raise HTTPException(404, "Recording not found") from None
+        if not recording["complete"] or recording["duration"] <= 0:
+            raise HTTPException(409, "Recording is incomplete or empty")
+        if len(set(body.embedding_models)) != len(body.embedding_models):
+            raise HTTPException(422, "Embedding models must be unique")
+        unknown = set(body.embedding_models) - set(embedding_catalog)
+        if unknown:
+            raise HTTPException(422, f"Unknown embedding models: {', '.join(sorted(unknown))}")
+        if body.stt_model not in catalog:
+            raise HTTPException(422, "Unknown STT model")
+        if body.language not in catalog[body.stt_model]["languages"]:
+            raise HTTPException(422, "The STT model does not support that language")
+        if set(body.thresholds) - set(body.embedding_models):
+            raise HTTPException(422, "Thresholds may only target selected embedding models")
+        if any(not -1 <= value <= 1 for value in body.thresholds.values()):
+            raise HTTPException(422, "Cosine thresholds must be between -1 and 1")
+        unavailable = [
+            ident for ident in body.embedding_models
+            if not Path(embedding_catalog[ident]["python"]).is_file()
+            or (embedding_catalog[ident].get("source_path")
+                and not Path(embedding_catalog[ident]["source_path"]).is_dir())
+        ]
+        if unavailable:
+            raise HTTPException(409, f"Speaker runtime is not installed: {', '.join(unavailable)}")
+        if not Path(catalog[body.stt_model]["python"]).is_file():
+            raise HTTPException(409, "Selected STT runtime is not installed")
+        return jobs.submit(body.model_dump())
+
+    @app.get("/speaker-benchmarks/{ident}")
+    async def speaker_benchmark(ident: str):
+        try:
+            return store.speaker_job(ident)
+        except KeyError:
+            raise HTTPException(404, "Speaker benchmark not found") from None
+
+    @app.post("/speaker-benchmarks/{ident}/cancel")
+    async def cancel_speaker_benchmark(ident: str):
+        try:
+            return await jobs.cancel(ident)
+        except KeyError:
+            raise HTTPException(404, "Speaker benchmark not found") from None
 
     @app.patch("/runs/{ident}/client-metrics")
     async def client_metrics(ident: str, body: ClientMetrics):

@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/testing.dart';
 import 'package:http/http.dart' as http;
 import 'package:local_stt_lab/main.dart';
+import 'package:local_stt_lab/speaker_lab.dart';
 
 const catalog = [
   {
@@ -27,13 +28,12 @@ const catalog = [
   },
 ];
 
-Widget lab(List<Map<String, Object>> models) => MaterialApp(
-    home: LabPage(
-        client: MockClient((request) async {
-          expect(request.url.path, '/models');
-          return http.Response(jsonEncode(models), 200,
-              headers: {'content-type': 'application/json; charset=utf-8'});
-        })));
+Widget lab(List<Map<String, Object>> models) =>
+    MaterialApp(home: LabPage(client: MockClient((request) async {
+      expect(request.url.path, '/models');
+      return http.Response(jsonEncode(models), 200,
+          headers: {'content-type': 'application/json; charset=utf-8'});
+    })));
 
 void main() {
   testWidgets('visar STT-labbet', (tester) async {
@@ -51,7 +51,8 @@ void main() {
     await tester.tap(find.text('Qwen3-ASR 0.6B'));
     await tester.pumpAndSettle();
     expect(find.text('Vosk Small Svenska 0.15'), findsOneWidget);
-    expect(find.text('Vosk Small English 0.15 (ej installerad)'), findsOneWidget);
+    expect(
+        find.text('Vosk Small English 0.15 (ej installerad)'), findsOneWidget);
   });
 
   testWidgets('Vosk begränsar språkvalet till modellens språk', (tester) async {
@@ -70,7 +71,8 @@ void main() {
     expect(find.text('English'), findsNothing);
   });
 
-  testWidgets('språket byts när modellen inte stöder det valda', (tester) async {
+  testWidgets('språket byts när modellen inte stöder det valda',
+      (tester) async {
     await tester.pumpWidget(lab(catalog));
     await tester.pumpAndSettle();
 
@@ -97,5 +99,51 @@ void main() {
     expect(find.text('Servern erbjuder inga modeller'), findsOneWidget);
     final button = tester.widget<FilledButton>(find.byType(FilledButton));
     expect(button.onPressed, isNull);
+  });
+
+  testWidgets('talarbenchmark visar modellstatus och kräver inspelning',
+      (tester) async {
+    final client = MockClient((request) async {
+      final body = switch (request.url.path) {
+        '/recordings' || '/speaker-profiles' => const [],
+        '/speaker-models' => const [
+            {'id': 'campplus', 'name': 'CAM++ 200k', 'available': true},
+            {'id': 'eres2net', 'name': 'ERes2Net 200k', 'available': false}
+          ],
+        '/models' => const [
+            {
+              'id': 'vosk-sv',
+              'name': 'Vosk Svenska',
+              'available': true,
+              'languages': ['sv']
+            }
+          ],
+        _ => throw StateError('Unexpected ${request.url.path}')
+      };
+      return http.Response(jsonEncode(body), 200,
+          headers: {'content-type': 'application/json; charset=utf-8'});
+    });
+    await tester
+        .pumpWidget(MaterialApp(home: SpeakerBenchmarkPage(client: client)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Vem sade vad?'), findsOneWidget);
+    expect(find.text('CAM++ 200k'), findsOneWidget);
+    expect(find.text('Runtime saknas'), findsOneWidget);
+    final start = tester.widget<FilledButton>(
+        find.widgetWithText(FilledButton, 'KÖR ALLA VALDA'));
+    expect(start.onPressed, isNull);
+  });
+
+  testWidgets('profilvyn visar tomt röstarkiv', (tester) async {
+    final client = MockClient((request) async => http.Response('[]', 200,
+        headers: {'content-type': 'application/json'}));
+    await tester
+        .pumpWidget(MaterialApp(home: SpeakerProfilesPage(client: client)));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Röstarkiv'), findsOneWidget);
+    expect(find.text('Inga röster registrerade ännu.'), findsOneWidget);
+    expect(find.text('NY PROFIL'), findsOneWidget);
   });
 }
