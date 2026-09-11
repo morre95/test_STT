@@ -18,11 +18,14 @@ from .catalog import models, public_models
 from .runtime import Runtime
 from .speaker_catalog import public_speaker_models, speaker_models
 from .speaker_jobs import SpeakerJobs
+from .speaker_runtime import LiveSpeakerRuntime
 from .store import Store
 
 BYTES_PER_SECOND = 32000
 FRAME_BYTES = 3200
 MAX_SECONDS = 3600
+LIVE_SPEAKER_WINDOW_BYTES = round(1.5 * BYTES_PER_SECOND)
+LIVE_SPEAKER_STEP_BYTES = round(0.75 * BYTES_PER_SECOND)
 
 
 class Start(BaseModel):
@@ -79,6 +82,13 @@ class SpeakerBenchmarkStart(BaseModel):
     thresholds: dict[str, float] = Field(default_factory=dict)
 
 
+class LiveSpeakerStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["start"]
+    model: str
+    threshold: float | None = Field(default=None, ge=-1, le=1)
+
+
 # Vosk decodes every frame it is given, so it exposes no streaming tunables.
 SETTING_CHOICES = {
     "qwen": {"chunk_seconds": (0.5, 1, 2, 3)},
@@ -101,7 +111,7 @@ def validated_settings(spec, settings):
 
 
 def create_app(data_dir=None, runtime=None, catalog=None, embedding_catalog=None,
-               speaker_runtime_factory=None):
+               speaker_runtime_factory=None, live_speaker_runtime_factory=None):
     data_dir = Path(data_dir or os.environ.get("STT_DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
     store = Store(data_dir)
     engine = runtime or Runtime(data_dir)
@@ -111,6 +121,7 @@ def create_app(data_dir=None, runtime=None, catalog=None, embedding_catalog=None
     jobs = SpeakerJobs(store, embedding_catalog, catalog, engine, busy,
                        **({"runtime_factory": speaker_runtime_factory}
                           if speaker_runtime_factory else {}))
+    live_runtime_factory = live_speaker_runtime_factory or LiveSpeakerRuntime
 
     @asynccontextmanager
     async def lifespan(app):
@@ -342,6 +353,70 @@ def create_app(data_dir=None, runtime=None, catalog=None, embedding_catalog=None
         run["client_metrics"] = body.model_dump()
         store.save_run(run)
         return {"ok": True}
+
+    @app.websocket("/ws/speaker-identify")
+    async def identify_speaker(ws: WebSocket):
+        await ws.accept()
+        if busy.locked():
+            await ws.send_json({"type": "error", "message": "Another test is running"})
+            await ws.close(code=1013)
+            return
+        await busy.acquire()
+        speaker_runtime = live_runtime_factory(data_dir)
+        try:
+            start = LiveSpeakerStart.model_validate(
+                await asyncio.wait_for(ws.receive_json(), 15))
+            if start.model not in embedding_catalog:
+                raise ValueError("Unknown speaker model")
+            spec = embedding_catalog[start.model]
+            if not Path(spec["python"]).is_file():
+                raise ValueError("Speaker runtime is not installed")
+            if spec.get("source_path") and not Path(spec["source_path"]).is_dir():
+                raise ValueError("3D-Speaker source is not installed")
+            profiles = [item for item in jobs.profiles() if item["samples"]]
+            if not profiles:
+                raise ValueError("Create a speaker profile with at least one voice sample first")
+
+            await ws.send_json({"type": "loading", "model": start.model})
+            metadata = await speaker_runtime.load(spec, profiles, start.threshold)
+            await ws.send_json({"type": "ready", **metadata})
+            window = bytearray()
+            since_result = 0
+            while True:
+                message = await asyncio.wait_for(ws.receive(), 30)
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect()
+                if message.get("bytes") is not None:
+                    pcm = message["bytes"]
+                    if not pcm or len(pcm) > FRAME_BYTES or len(pcm) % 2:
+                        raise ValueError("Audio frames must contain 1–1600 PCM16 samples")
+                    window.extend(pcm)
+                    since_result += len(pcm)
+                    if len(window) > LIVE_SPEAKER_WINDOW_BYTES:
+                        del window[:-LIVE_SPEAKER_WINDOW_BYTES]
+                    if (len(window) == LIVE_SPEAKER_WINDOW_BYTES and
+                            since_result >= LIVE_SPEAKER_STEP_BYTES):
+                        since_result = 0
+                        result = await speaker_runtime.identify(bytes(window))
+                        await ws.send_json({"type": "speaker", **result})
+                else:
+                    import json
+                    control = json.loads(message.get("text", ""))
+                    if control != {"type": "stop"}:
+                        raise ValueError("Expected PCM audio or stop")
+                    await ws.send_json({"type": "stopped"})
+                    return
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:  # noqa: BLE001 - WebSocket protocol boundary
+            with contextlib.suppress(Exception):
+                await ws.send_json({"type": "error",
+                                    "message": str(exc) or type(exc).__name__})
+        finally:
+            await speaker_runtime.close()
+            busy.release()
+            with contextlib.suppress(Exception):
+                await ws.close()
 
     @app.websocket("/ws/transcribe")
     async def transcribe(ws: WebSocket):

@@ -5,6 +5,7 @@ import importlib
 import math
 import time
 import urllib.request
+import wave
 from functools import lru_cache
 from pathlib import Path
 
@@ -39,6 +40,24 @@ def _unit(vector):
     vector = np.asarray(vector, dtype=np.float32).reshape(-1)
     norm = np.linalg.norm(vector)
     return vector / max(float(norm), 1e-12)
+
+
+def _load_normalized_wave(path):
+    """Read the PCM16/16 kHz files produced by ``normalize_audio``.
+
+    TorchAudio 2.9+ routes ``torchaudio.load`` through TorchCodec. The speaker
+    pipeline only consumes our own normalized WAV files, so the standard
+    library is both sufficient and avoids an unnecessary FFmpeg/TorchCodec
+    dependency in the isolated model environment.
+    """
+    import torch
+
+    with wave.open(str(path), "rb") as source:
+        if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, 16000):
+            raise ValueError("Speaker audio must be normalized mono PCM16 at 16 kHz")
+        pcm = source.readframes(source.getnframes())
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    return torch.from_numpy(samples)
 
 
 def _dynamic(path):
@@ -216,17 +235,12 @@ def _turns(regions, windows, labels):
 
 
 def _profile_embedding(adapter, sample, cache_dir):
-    import torchaudio
-
     folder = cache_dir / "profile-embeddings" / sample["model_id"]
     folder.mkdir(parents=True, exist_ok=True)
     cached = folder / f"{sample['id']}.npy"
     if cached.is_file():
         return _unit(np.load(cached))
-    waveform, rate = torchaudio.load(sample["path"])
-    if rate != 16000:
-        waveform = torchaudio.functional.resample(waveform, rate, 16000)
-    waveform = waveform[0]
+    waveform = _load_normalized_wave(sample["path"])
     regions = _speech_regions(waveform)
     windows = _windows(regions, waveform.shape[-1] / 16000)
     embeddings = [adapter.embed(waveform[int(start * 16000):int(end * 16000)])
@@ -239,11 +253,17 @@ def _profile_embedding(adapter, sample, cache_dir):
 
 
 def _calibrate(profiles, vectors, manual_threshold):
+    centroids = {ident: _unit(np.mean(items, axis=0))
+                 for ident, items in vectors.items() if items}
     sufficient = len(profiles) >= 2 and all(len(vectors[p["id"]]) >= 2 for p in profiles)
     if not sufficient:
+        if manual_threshold is not None and centroids:
+            return {"available": True, "threshold": float(manual_threshold),
+                    "automatic_threshold": None, "manual_override": True,
+                    "reason": "Manual threshold; automatic calibration needs two profiles "
+                              "with two samples each"}, centroids
         return {"available": False,
-                "reason": "At least two profiles with two samples each are required"}, {}
-    centroids = {ident: _unit(np.mean(items, axis=0)) for ident, items in vectors.items()}
+                "reason": "At least two profiles with two samples each are required"}, centroids
     genuine, impostor = [], []
     for profile in profiles:
         ident = profile["id"]
@@ -270,15 +290,11 @@ def _calibrate(profiles, vectors, manual_threshold):
 def run_diarization(spec, audio_path, cache_dir, profiles, speaker_count=None,
                     manual_threshold=None):
     import torch
-    import torchaudio
 
     started = time.perf_counter()
     adapter = load_adapter(spec, Path(cache_dir))
     load_seconds = time.perf_counter() - started
-    waveform, rate = torchaudio.load(audio_path)
-    if rate != 16000:
-        waveform = torchaudio.functional.resample(waveform, rate, 16000)
-    waveform = waveform[0].to(torch.float32)
+    waveform = _load_normalized_wave(audio_path).to(torch.float32)
     duration = waveform.shape[-1] / 16000
     regions = _speech_regions(waveform)
     windows = _windows(regions, duration)
@@ -326,3 +342,64 @@ def run_diarization(spec, audio_path, cache_dir, profiles, speaker_count=None,
             "timing": {"load_seconds": load_seconds,
                        "embedding_and_clustering_seconds": processing_seconds,
                        "rtf": processing_seconds / duration if duration else None}}
+
+
+class LiveSpeakerIdentifier:
+    """Identify one live PCM window against enrolled profile centroids."""
+
+    DEFAULT_THRESHOLD = 0.5
+
+    def __init__(self, spec, cache_dir, profiles, manual_threshold=None):
+        started = time.perf_counter()
+        cache_dir = Path(cache_dir)
+        self.adapter = load_adapter(spec, cache_dir)
+        self.profiles = {profile["id"]: profile for profile in profiles if profile["samples"]}
+        if not self.profiles:
+            raise ValueError("Create a speaker profile with at least one voice sample first")
+        vectors = {
+            ident: [
+                _profile_embedding(
+                    self.adapter, {**sample, "model_id": spec["id"]}, cache_dir)
+                for sample in profile["samples"]
+            ]
+            for ident, profile in self.profiles.items()
+        }
+        calibration, self.centroids = _calibrate(
+            list(self.profiles.values()), vectors, manual_threshold)
+        self.threshold = (float(manual_threshold) if manual_threshold is not None
+                          else calibration.get("threshold", self.DEFAULT_THRESHOLD))
+        self.metadata = {
+            "model": spec["id"], "runtime": self.adapter.metadata,
+            "calibration": calibration, "threshold": self.threshold,
+            "profiles": [{"id": profile["id"], "name": profile["name"]}
+                         for profile in self.profiles.values()],
+            "load_seconds": time.perf_counter() - started,
+        }
+
+    def identify(self, pcm):
+        import torch
+
+        started = time.perf_counter()
+        waveform = torch.from_numpy(
+            np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0)
+        regions = _speech_regions(waveform)
+        speech_seconds = sum(end - start for start, end in regions)
+        if speech_seconds < 0.25:
+            return {"speech": False, "speaker": None, "profile_id": None,
+                    "score": None, "scores": [],
+                    "processing_ms": (time.perf_counter() - started) * 1000}
+
+        embedding = self.adapter.embed(waveform)
+        scores = sorted(({
+            "profile_id": ident,
+            "speaker": self.profiles[ident]["name"],
+            "score": float(embedding @ centroid),
+        } for ident, centroid in self.centroids.items()),
+            key=lambda item: item["score"], reverse=True)
+        best = scores[0]
+        known = best["score"] >= self.threshold
+        return {"speech": True,
+                "speaker": best["speaker"] if known else "Okänd",
+                "profile_id": best["profile_id"] if known else None,
+                "score": best["score"], "scores": scores,
+                "processing_ms": (time.perf_counter() - started) * 1000}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -54,6 +55,82 @@ class SpeakerRuntime:
         if "error" in result:
             raise RuntimeError(result["error"])
         return result
+
+    async def close(self):
+        if self.process and self.process.returncode is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(self.process.wait(), 10)
+            except TimeoutError:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await self.process.wait()
+        if self.log:
+            self.log.close()
+        self.process = self.log = None
+
+
+class LiveSpeakerRuntime:
+    """Persistent speaker worker used by one live WebSocket session."""
+
+    def __init__(self, log_dir: Path):
+        self.log_dir = log_dir
+        self.process = None
+        self.log = None
+
+    async def _request(self, message, timeout=120):
+        if self.process is None or self.process.returncode is not None:
+            raise RuntimeError("Speaker process is not running; see speaker-runtime.log")
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        await self.process.stdin.drain()
+        while True:
+            line = await asyncio.wait_for(self.process.stdout.readline(), timeout)
+            if not line:
+                raise RuntimeError("Speaker process exited; see speaker-runtime.log")
+            try:
+                result = json.loads(line)
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.log.write(line.decode(errors="replace"))
+                self.log.flush()
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result
+
+    async def load(self, spec, profiles, threshold=None):
+        await self.close()
+        python = Path(spec["python"])
+        if not python.is_file():
+            raise RuntimeError("Install the speaker runtime first (see README)")
+        self.log = (self.log_dir / "speaker-runtime.log").open("a")
+        python_paths = [str(Path(__file__).resolve().parents[1])]
+        if spec.get("source_path"):
+            python_paths.append(spec["source_path"])
+        if os.environ.get("PYTHONPATH"):
+            python_paths.append(os.environ["PYTHONPATH"])
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(python_paths)}
+        self.process = await asyncio.create_subprocess_exec(
+            str(python), "-u", "-m", "stt_lab.speaker_worker",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=self.log, start_new_session=True, env=env, limit=4 * 1024 * 1024,
+        )
+        return await self._request({
+            "op": "load_live",
+            "model": {key: value for key, value in spec.items() if key != "python"},
+            "cache_dir": str(self.log_dir / "models"),
+            "profiles": profiles,
+            "manual_threshold": threshold,
+        }, timeout=1800)
+
+    async def identify(self, pcm):
+        return await self._request({
+            "op": "identify", "pcm": base64.b64encode(pcm).decode(),
+        })
 
     async def close(self):
         if self.process and self.process.returncode is None:

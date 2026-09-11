@@ -36,7 +36,7 @@ class SpeakerJobs:
         job.update(changes)
         self.store.save_speaker_job(job)
 
-    def _profiles(self):
+    def profiles(self):
         result = []
         for profile in self.store.profiles():
             samples = [
@@ -82,7 +82,7 @@ class SpeakerJobs:
                 recording = self.store.recording(job["recording_id"])
                 audio_path = self.store.audio_path(job["recording_id"])
                 reference = self.store.speaker_reference(job["recording_id"])
-                profiles = self._profiles()
+                profiles = self.profiles()
                 total_models = len(request["embedding_models"])
                 self._update(job, status="running", stage="Förbereder talarmodeller",
                              progress=0.01)

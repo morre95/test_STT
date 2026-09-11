@@ -49,6 +49,25 @@ class FakeSpeakerRuntime:
         pass
 
 
+class FakeLiveSpeakerRuntime:
+    def __init__(self, data_dir):
+        pass
+
+    async def load(self, spec, profiles, threshold):
+        return {"model": spec["id"], "threshold": threshold or 0.5,
+                "calibration": {"available": False},
+                "profiles": [{"id": item["id"], "name": item["name"]}
+                              for item in profiles]}
+
+    async def identify(self, pcm):
+        assert len(pcm) == 48000
+        return {"speech": True, "speaker": "Ada", "profile_id": "profile",
+                "score": 0.8, "scores": [], "processing_ms": 10}
+
+    async def close(self):
+        pass
+
+
 def wav_bytes(seconds=3):
     output = io.BytesIO()
     with wave.open(output, "wb") as target:
@@ -155,3 +174,38 @@ def test_rejects_bad_audio_and_same_speaker_overlap(tmp_path):
         response = client.put(
             f"/recordings/{recording_id}/speaker-reference", json=reference)
         assert response.status_code == 422
+
+
+def test_live_speaker_identification_stream(tmp_path):
+    embedding_catalog = {
+        "fake-speaker": {
+            "id": "fake-speaker", "name": "Fake Speaker", "toolkit": "test",
+            "checkpoint": "fake", "revision": "test", "python": sys.executable,
+        }
+    }
+    app = create_app(
+        tmp_path, runtime=FakeRuntime(), catalog={},
+        embedding_catalog=embedding_catalog,
+        live_speaker_runtime_factory=FakeLiveSpeakerRuntime,
+    )
+    with TestClient(app) as client:
+        profile = client.post("/speaker-profiles", json={"name": "Ada"}).json()
+        sample = client.post(
+            f"/speaker-profiles/{profile['id']}/samples",
+            files={"file": ("ada.wav", wav_bytes(), "audio/wav")},
+        )
+        assert sample.status_code == 201
+
+        with client.websocket_connect("/ws/speaker-identify") as socket:
+            socket.send_json({"type": "start", "model": "fake-speaker"})
+            assert socket.receive_json()["type"] == "loading"
+            ready = socket.receive_json()
+            assert ready["type"] == "ready"
+            assert ready["profiles"][0]["name"] == "Ada"
+            for _ in range(15):
+                socket.send_bytes(bytes(3200))
+            result = socket.receive_json()
+            assert result["type"] == "speaker"
+            assert result["speaker"] == "Ada"
+            socket.send_json({"type": "stop"})
+            assert socket.receive_json()["type"] == "stopped"

@@ -128,8 +128,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Vem sade vad?'), findsOneWidget);
+    expect(find.text('IDENTIFIERING'), findsOneWidget);
     expect(find.text('CAM++ 200k'), findsOneWidget);
-    expect(find.text('Runtime saknas'), findsOneWidget);
+    await tester.drag(find.byType(ListView), const Offset(0, -700));
+    await tester.pumpAndSettle();
+    expect(find.text('Runtime saknas'), findsWidgets);
     final start = tester.widget<FilledButton>(
         find.widgetWithText(FilledButton, 'KÖR ALLA VALDA'));
     expect(start.onPressed, isNull);

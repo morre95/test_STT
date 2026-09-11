@@ -78,7 +78,15 @@ gräns mot *Okänd* kräver minst två personer och två separata röstprov per
 person. Kalibreringen använder bara profilklippen; mötesfacit läcker aldrig in
 i tröskeln.
 
-I fliken **Talare**:
+Överst i fliken **Talare** finns **Live-identifiering**. Välj en
+embeddingmodell och tryck **Starta live**. Mikrofonen skickar PCM16-ljud till
+servern och appen visar bästa profil, cosinuslikhet, beslutsgräns och
+modellens bearbetningstid var 0,75 sekund. Ett röstprov räcker för att prova
+läget; två profiler med två prov var ger en automatiskt kalibrerad gräns mot
+*Okänd*. Modellerna körs en i taget eftersom flera tunga embeddingmodeller
+samtidigt inte ger en rättvis realtidsmätning.
+
+Den numrerade delen under livekortet är ett separat efterhandsbenchmark:
 
 1. välj en befintlig mobilinspelning eller ladda upp WAV/FLAC,
 2. lägg till facittalare och tidssegment med text,

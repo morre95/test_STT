@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 import 'package:record/record.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 const lime = Color(0xffd6f36b);
 const orange = Color(0xffff935c);
@@ -18,6 +19,11 @@ Uri serverUri(TextEditingController host, String path) {
   final parsed = Uri.parse(value);
   return Uri.parse(
       'http://${parsed.host}:${parsed.hasPort ? parsed.port : 8000}$path');
+}
+
+Uri serverWsUri(TextEditingController host, String path) {
+  final httpUri = serverUri(host, path);
+  return httpUri.replace(scheme: 'ws');
 }
 
 String responseError(http.Response response) {
@@ -114,6 +120,10 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
   late final http.Client client = widget.client ?? http.Client();
   final host = TextEditingController(text: '10.0.2.2:8000');
   final player = AudioPlayer();
+  final liveRecorder = AudioRecorder();
+  StreamSubscription<Uint8List>? liveMicrophone;
+  StreamSubscription? liveEvents;
+  WebSocketChannel? liveSocket;
   List<RecordingInfo> recordings = [];
   List<CatalogChoice> embeddings = [];
   List<CatalogChoice> sttModels = [];
@@ -129,6 +139,15 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
   Map<String, dynamic>? job;
   Timer? timer;
   bool loading = false;
+  String? liveModel;
+  bool liveLoading = false;
+  bool liveRunning = false;
+  String liveStatus = 'Registrera minst ett röstprov i Profiler';
+  String liveSpeaker = '—';
+  double? liveScore;
+  double? liveThreshold;
+  double? liveProcessingMs;
+  List<Map<String, dynamic>> liveScores = [];
 
   RecordingInfo? get selectedRecording =>
       recordings.where((item) => item.id == recordingId).firstOrNull;
@@ -185,6 +204,11 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
           selectedModels.addAll(nextEmbeddings
               .where((item) => item.available)
               .map((item) => item.id));
+        }
+        if (!nextEmbeddings
+            .any((item) => item.id == liveModel && item.available)) {
+          liveModel =
+              nextEmbeddings.where((item) => item.available).firstOrNull?.id;
         }
         if (!nextStt.any((item) => item.id == sttModel && item.available)) {
           sttModel = nextStt.where((item) => item.available).firstOrNull?.id;
@@ -469,9 +493,116 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
     await poll();
   }
 
+  Future<void> _beginLiveMicrophone() async {
+    final stream = await liveRecorder.startStream(const RecordConfig(
+        encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1));
+    liveMicrophone = stream.listen((bytes) {
+      for (var offset = 0; offset < bytes.length; offset += 3200) {
+        final end = offset + 3200 < bytes.length ? offset + 3200 : bytes.length;
+        liveSocket?.sink.add(Uint8List.sublistView(bytes, offset, end));
+      }
+    });
+    if (!mounted) return;
+    setState(() {
+      liveLoading = false;
+      liveRunning = true;
+      liveStatus = 'Lyssnar · nytt resultat var 0,75 s';
+    });
+  }
+
+  Future<void> startLive() async {
+    if (liveModel == null) return;
+    if (!profiles.any((profile) => profile.samples.isNotEmpty)) {
+      setState(() => liveStatus = 'Lägg till minst ett röstprov i Profiler');
+      return;
+    }
+    if (!await liveRecorder.hasPermission()) {
+      setState(() => liveStatus = 'Mikrofonbehörighet saknas');
+      return;
+    }
+    final channel =
+        WebSocketChannel.connect(serverWsUri(host, '/ws/speaker-identify'));
+    liveSocket = channel;
+    setState(() {
+      liveLoading = true;
+      liveSpeaker = '—';
+      liveScore = liveThreshold = liveProcessingMs = null;
+      liveScores = [];
+      liveStatus = 'Ansluter…';
+    });
+    liveEvents = channel.stream.listen((raw) async {
+      final message =
+          (jsonDecode(raw as String) as Map).cast<String, dynamic>();
+      if (!mounted) return;
+      if (message['type'] == 'loading') {
+        setState(() => liveStatus = 'Laddar modell och röstprofiler…');
+      } else if (message['type'] == 'ready') {
+        setState(() {
+          liveThreshold = (message['threshold'] as num?)?.toDouble();
+          liveStatus = 'Startar mikrofon…';
+        });
+        await _beginLiveMicrophone();
+      } else if (message['type'] == 'speaker') {
+        final speech = message['speech'] == true;
+        setState(() {
+          liveSpeaker =
+              speech ? (message['speaker']?.toString() ?? 'Okänd') : '—';
+          liveScore = (message['score'] as num?)?.toDouble();
+          liveProcessingMs = (message['processing_ms'] as num?)?.toDouble();
+          liveScores = ((message['scores'] as List?) ?? const [])
+              .map((item) => (item as Map).cast<String, dynamic>())
+              .toList();
+          liveStatus = speech ? 'Röst identifierad' : 'Lyssnar · inget tal';
+        });
+      } else if (message['type'] == 'error') {
+        await _stopLiveCapture();
+        if (mounted) {
+          setState(
+              () => liveStatus = message['message']?.toString() ?? 'Modellfel');
+        }
+      } else if (message['type'] == 'stopped') {
+        await _stopLiveCapture();
+      }
+    }, onError: (error) async {
+      await _stopLiveCapture();
+      if (mounted) setState(() => liveStatus = 'Anslutningen bröts: $error');
+    }, onDone: () async {
+      await _stopLiveCapture();
+    });
+    try {
+      await channel.ready.timeout(const Duration(seconds: 8));
+      channel.sink.add(jsonEncode({'type': 'start', 'model': liveModel}));
+    } catch (error) {
+      await _stopLiveCapture();
+      if (mounted) setState(() => liveStatus = 'Kunde inte ansluta: $error');
+    }
+  }
+
+  Future<void> _stopLiveCapture() async {
+    await liveMicrophone?.cancel();
+    liveMicrophone = null;
+    if (liveRunning) await liveRecorder.stop();
+    if (mounted) {
+      setState(() {
+        liveLoading = false;
+        liveRunning = false;
+      });
+    }
+  }
+
+  Future<void> stopLive() async {
+    await _stopLiveCapture();
+    liveSocket?.sink.add(jsonEncode({'type': 'stop'}));
+    if (mounted) setState(() => liveStatus = 'Stoppad');
+  }
+
   @override
   void dispose() {
     timer?.cancel();
+    liveMicrophone?.cancel();
+    liveEvents?.cancel();
+    liveSocket?.sink.close();
+    liveRecorder.dispose();
     player.dispose();
     host.dispose();
     client.close();
@@ -492,6 +623,78 @@ class _SpeakerBenchmarkPageState extends State<SpeakerBenchmarkPage> {
               style: TextStyle(color: muted)),
           const SizedBox(height: 22),
           ServerField(controller: host, onRefresh: load),
+          const SizedBox(height: 14),
+          LabSection(
+              number: 'LIVE',
+              title: 'IDENTIFIERING',
+              child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text(
+                        'Välj en modell och identifiera registrerade profiler direkt från mikrofonen.',
+                        style: TextStyle(color: muted, fontSize: 12)),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                        isExpanded: true,
+                        initialValue: liveModel,
+                        decoration:
+                            const InputDecoration(labelText: 'Live-modell'),
+                        items: [
+                          for (final model in embeddings)
+                            DropdownMenuItem(
+                                value: model.id,
+                                enabled: model.available,
+                                child: Text(model.available
+                                    ? model.name
+                                    : '${model.name} (saknas)'))
+                        ],
+                        onChanged: liveLoading || liveRunning
+                            ? null
+                            : (value) => setState(() => liveModel = value)),
+                    const SizedBox(height: 14),
+                    Text(liveSpeaker,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            color: liveSpeaker == 'Okänd' ? orange : lime,
+                            fontSize: 31,
+                            fontWeight: FontWeight.w900)),
+                    if (liveScore != null)
+                      Text(
+                          'likhet ${liveScore!.toStringAsFixed(3)} · gräns ${liveThreshold?.toStringAsFixed(3) ?? '—'} · ${liveProcessingMs?.toStringAsFixed(0) ?? '—'} ms',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: muted, fontSize: 11)),
+                    if (liveScores.isNotEmpty) ...[
+                      const SizedBox(height: 9),
+                      Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: [
+                            for (final score in liveScores)
+                              MetricTag(
+                                  label: score['speaker'].toString(),
+                                  value: (score['score'] as num)
+                                      .toStringAsFixed(3))
+                          ])
+                    ],
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                        onPressed: loading || liveModel == null
+                            ? null
+                            : liveRunning || liveLoading
+                                ? stopLive
+                                : startLive,
+                        icon: Icon(liveRunning || liveLoading
+                            ? Icons.stop_circle_outlined
+                            : Icons.mic),
+                        label: Text(liveRunning || liveLoading
+                            ? 'STOPPA LIVE'
+                            : 'STARTA LIVE')),
+                    const SizedBox(height: 7),
+                    Text(liveStatus,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: muted, fontSize: 11))
+                  ])),
           const SizedBox(height: 14),
           Row(children: [
             Expanded(
